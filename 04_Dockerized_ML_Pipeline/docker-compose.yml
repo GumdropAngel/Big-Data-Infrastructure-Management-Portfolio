@@ -1,0 +1,156 @@
+version: '3.8'
+services:
+  #1. data source (operational database)
+  mysql-db:
+    image: mysql:5.7
+    container_name: mysql-db
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=retail_db
+      - MYSQL_USER=retail_user #specific user for Sqoop
+      - MYSQL_PASSWORD=retail_pass #specific password for Sqoop
+    ports:
+      - "3306:3306"
+    networks:
+      - data-network
+
+  #2. distributed storage (HDFS)
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    environment:
+      - CLUSTER_NAME=ml-cluster
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      - HDFS_CONF_dfs_namenode_datanode_registration_ip___hostname___check=false
+    ports:
+      - "9870:9870"
+      - "8020:8020"
+    networks:
+      - data-network
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    depends_on:
+      - namenode
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+    ports:
+      - "9864:9864"
+    networks:
+      - data-network
+
+  #3. data warehouse (Apache Hive & database metastore)
+  postgres-hive:
+    image: postgres:13
+    container_name: postgres-hive
+    environment:
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=hive
+      - POSTGRES_DB=metastore_db
+    networks:
+      - data-network
+
+  hive-server:
+    image: bde2020/hive:2.3.2-postgresql-metastore
+    container_name: hive-server
+    depends_on:
+      - namenode
+      - datanode
+      - postgres-hive
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870 datanode:9864 postgres-hive:5432
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:8020
+      #forcing metastore configuration to postgres (bypassing Derby) :
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionURL=jdbc:postgresql://postgres-hive:5432/metastore_db
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName=org.postgresql.Driver
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName=hive
+      - HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword=hive
+    ports:
+      - "10000:10000"
+      - "9083:9083"
+    networks:
+      - data-network
+
+  #4. processing engine (Apache Spark MLlib)
+  spark-master:
+    image: spark:python3-java17
+    container_name: spark-master
+    user: root #root access required to install vim
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+    ports:
+      - "8080:8080" #Spark Master UI
+      - "7077:7077" #internal communication port
+      - "4040:4040" #Spark application UI (PySpark)
+    command: >
+      bash -c "apt-get update &&
+      apt-get install -y vim nano &&
+      /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master"
+    networks:
+      - data-network
+
+  spark-worker:
+    image: spark:python3-java17
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    user: root
+    environment:
+      - SPARK_WORKER_CORES=1
+      - SPARK_WORKER_MEMORY=1g
+    command: >
+      bash -c "apt-get update &&
+      apt-get install -y vim nano &&
+      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077"
+    networks:
+      - data-network
+
+  #5. orchestration (Apache Airflow & database)
+  postgres-airflow:
+    image: postgres:13
+    container_name: postgres-airflow
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    networks:
+      - data-network
+
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow-standalone
+    depends_on:
+      - postgres-airflow
+    environment:
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    volumes:
+      #bridge : connecting Docker inside Airflow to host Docker
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: standalone
+    ports:
+      - "8081:8080"
+    networks:
+      - data-network
+
+  #6. ingestion tool (Apache Sqoop)
+  sqoop:
+    image: dvoros/sqoop
+    container_name: sqoop-client
+    depends_on:
+      - namenode
+      - mysql-db
+    environment:
+      - HADOOP_USER_NAME=root
+    networks:
+      - data-network
+    command: sleep infinity #forcing container to stay alive for interaction
+
+networks:
+  data-network:
+    driver: bridge

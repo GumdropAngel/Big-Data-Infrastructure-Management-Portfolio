@@ -1,0 +1,9 @@
+FROM apache/airflow:2.7.1
+#switching to root temporarily for installation
+USER root
+#installing Docker CLI and add airflow user to docker group
+RUN apt-get update && \
+ apt-get install -y docker.io && \
+ usermod -aG docker airflow
+#reverting security access to airflow user
+USER airflow
